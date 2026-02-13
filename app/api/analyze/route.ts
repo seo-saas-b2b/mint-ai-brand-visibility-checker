@@ -115,8 +115,8 @@ interface GeminiBatchResult {
 
 async function callGeminiWithRetry(
   body: object,
-  retries = 1,
-  delayMs = 2000
+  retries = 2,
+  fallbackDelayMs = 60000
 ): Promise<Response> {
   const apiKey = process.env.GEMINI_API_KEY;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
@@ -135,7 +135,24 @@ async function callGeminiWithRetry(
     lastRes = res;
 
     if (res.status === 429 && attempt < retries) {
-      console.warn(`Gemini 429 rate-limited, retrying in ${delayMs}ms (attempt ${attempt + 1})`);
+      // Try to parse the retryDelay from Gemini's error response
+      let delayMs = fallbackDelayMs;
+      try {
+        const errBody = await res.clone().json();
+        const retryInfo = errBody?.error?.details?.find(
+          (d: { '@type': string }) => d['@type']?.includes('RetryInfo')
+        );
+        if (retryInfo?.retryDelay) {
+          const seconds = parseFloat(retryInfo.retryDelay);
+          if (!isNaN(seconds) && seconds > 0) {
+            delayMs = Math.ceil(seconds * 1000) + 2000; // Add 2s buffer
+          }
+        }
+      } catch {
+        // Use fallback delay
+      }
+
+      console.warn(`Gemini 429 rate-limited, retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt + 1}/${retries})`);
       await new Promise((r) => setTimeout(r, delayMs));
       continue;
     }
@@ -566,11 +583,19 @@ export async function POST(request: NextRequest) {
     // --- Step 1: Generate 13 prompts via AI ---
     const prompts = await generatePromptsWithAI(industryName, countryName, websiteUrl);
 
-    // --- Step 2: Query all 3 platforms in parallel (only 2 Gemini calls + 1 OpenAI) ---
-    const [geminiOverviewResult, geminiModeResult, chatgptResult] = await Promise.allSettled([
+    // --- Step 2: Query all 3 platforms ---
+    // Stagger Gemini calls to avoid hitting per-minute rate limits.
+    // Run Gemini AI Overview + ChatGPT in parallel first, then Gemini AI Mode.
+    const [geminiOverviewResult, chatgptResult] = await Promise.allSettled([
       batchQueryGemini(prompts, brandName, 'concise'),
-      batchQueryGemini(prompts, brandName, 'conversational'),
       batchQueryChatGPT(prompts, brandName),
+    ]);
+
+    // Small delay before second Gemini call to stay within RPM limits
+    await new Promise((r) => setTimeout(r, 5000));
+
+    const [geminiModeResult] = await Promise.allSettled([
+      batchQueryGemini(prompts, brandName, 'conversational'),
     ]);
 
     const overviewData: GeminiBatchResult =
