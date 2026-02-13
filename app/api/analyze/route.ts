@@ -165,6 +165,108 @@ async function callGeminiWithRetry(
 }
 
 // ---------------------------------------------------------------------------
+// Shared helper: extract per-query full responses from AI text
+// ---------------------------------------------------------------------------
+function extractFullResponses(
+  text: string,
+  prompts: string[]
+): Record<string, string> {
+  const fullResponses: Record<string, string> = {};
+  const analysisStart = text.indexOf('ANALYSIS_JSON_START');
+  const contentText = analysisStart > 0 ? text.slice(0, analysisStart) : text;
+
+  // Strategy 1: Look for "--- QUERY N ---" markers
+  let foundMarkers = 0;
+  for (let i = 0; i < prompts.length; i++) {
+    const marker = `--- QUERY ${i + 1} ---`;
+    if (contentText.includes(marker)) foundMarkers++;
+  }
+
+  if (foundMarkers >= prompts.length * 0.5) {
+    // Use marker-based extraction
+    for (let i = 0; i < prompts.length; i++) {
+      const key = `query_${i + 1}`;
+      const startMarker = `--- QUERY ${i + 1} ---`;
+      const endMarker =
+        i < prompts.length - 1 ? `--- QUERY ${i + 2} ---` : 'ANALYSIS_JSON_START';
+
+      const startIdx = contentText.indexOf(startMarker);
+      const endIdx = contentText.indexOf(endMarker, startIdx + startMarker.length);
+
+      if (startIdx >= 0 && endIdx > startIdx) {
+        fullResponses[key] = contentText.slice(startIdx + startMarker.length, endIdx).trim();
+      } else if (startIdx >= 0) {
+        fullResponses[key] = contentText.slice(startIdx + startMarker.length).trim();
+      } else {
+        fullResponses[key] = '';
+      }
+    }
+    return fullResponses;
+  }
+
+  // Strategy 2: Look for various heading patterns (Query 1:, **Query 1**, ## Query 1, etc.)
+  const headingPatterns = [
+    /(?:^|\n)\s*\*{0,2}Query\s+(\d+)\*{0,2}\s*[:\.\-]/gim,
+    /(?:^|\n)\s*#{1,3}\s*Query\s+(\d+)/gim,
+    /(?:^|\n)\s*(?:---\s*)?(?:QUERY|Query)\s+(\d+)/gim,
+  ];
+
+  for (const pattern of headingPatterns) {
+    const matches = [...contentText.matchAll(pattern)];
+    if (matches.length >= prompts.length * 0.5) {
+      // Found enough headings, split by them
+      for (let i = 0; i < prompts.length; i++) {
+        const key = `query_${i + 1}`;
+        const match = matches.find((m) => parseInt(m[1]) === i + 1);
+        if (match && match.index !== undefined) {
+          const startIdx = match.index + match[0].length;
+          const nextMatch = matches.find((m) => parseInt(m[1]) === i + 2);
+          const endIdx = nextMatch?.index ?? contentText.length;
+          fullResponses[key] = contentText.slice(startIdx, endIdx).trim();
+        } else {
+          fullResponses[key] = '';
+        }
+      }
+      return fullResponses;
+    }
+  }
+
+  // Strategy 3: Try to match by prompt text appearing in the response
+  const promptPositions: { index: number; promptIdx: number }[] = [];
+  for (let i = 0; i < prompts.length; i++) {
+    // Look for the prompt text (or first 40 chars) in the response
+    const searchText = prompts[i].slice(0, 40).toLowerCase();
+    const idx = contentText.toLowerCase().indexOf(searchText);
+    if (idx >= 0) {
+      promptPositions.push({ index: idx, promptIdx: i });
+    }
+  }
+  promptPositions.sort((a, b) => a.index - b.index);
+
+  if (promptPositions.length >= prompts.length * 0.5) {
+    for (let j = 0; j < promptPositions.length; j++) {
+      const key = `query_${promptPositions[j].promptIdx + 1}`;
+      const startIdx = promptPositions[j].index;
+      const endIdx =
+        j < promptPositions.length - 1 ? promptPositions[j + 1].index : contentText.length;
+      fullResponses[key] = contentText.slice(startIdx, endIdx).trim();
+    }
+    // Fill any missing
+    for (let i = 0; i < prompts.length; i++) {
+      const key = `query_${i + 1}`;
+      if (!fullResponses[key]) fullResponses[key] = '';
+    }
+    return fullResponses;
+  }
+
+  // Strategy 4: Fallback — assign the entire text as one response to all queries
+  for (let i = 0; i < prompts.length; i++) {
+    fullResponses[`query_${i + 1}`] = contentText.trim();
+  }
+  return fullResponses;
+}
+
+// ---------------------------------------------------------------------------
 // Batch Gemini call (one call, all prompts)
 // ---------------------------------------------------------------------------
 async function batchQueryGemini(
@@ -215,29 +317,8 @@ For each query, check if "${brandName}" was specifically named in your answer an
     const data = await res.json();
     const text: string = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-    // Extract per-query full responses
-    const fullResponses: Record<string, string> = {};
-    for (let i = 0; i < prompts.length; i++) {
-      const key = `query_${i + 1}`;
-      const startMarker = `--- QUERY ${i + 1} ---`;
-      const endMarker =
-        i < prompts.length - 1 ? `--- QUERY ${i + 2} ---` : 'ANALYSIS_JSON_START';
-
-      const startIdx = text.indexOf(startMarker);
-      const endIdx = text.indexOf(endMarker, startIdx + startMarker.length);
-
-      if (startIdx >= 0 && endIdx > startIdx) {
-        fullResponses[key] = text.slice(startIdx + startMarker.length, endIdx).trim();
-      } else if (startIdx >= 0) {
-        // Last query or marker not found — take until ANALYSIS_JSON_START or end
-        const analysisIdx = text.indexOf('ANALYSIS_JSON_START', startIdx);
-        fullResponses[key] = text
-          .slice(startIdx + startMarker.length, analysisIdx > startIdx ? analysisIdx : undefined)
-          .trim();
-      } else {
-        fullResponses[key] = '';
-      }
-    }
+    // Extract per-query full responses using shared helper
+    const fullResponses = extractFullResponses(text, prompts);
 
     // Parse the JSON analysis block
     const jsonMatch = text.match(/ANALYSIS_JSON_START\s*([\s\S]*?)\s*ANALYSIS_JSON_END/);
@@ -341,28 +422,8 @@ For each query, check if "${brandName}" was specifically named in your answer an
 
     const text = res.choices[0]?.message?.content || '';
 
-    // Extract per-query full responses
-    const fullResponses: Record<string, string> = {};
-    for (let i = 0; i < prompts.length; i++) {
-      const key = `query_${i + 1}`;
-      const startMarker = `--- QUERY ${i + 1} ---`;
-      const endMarker =
-        i < prompts.length - 1 ? `--- QUERY ${i + 2} ---` : 'ANALYSIS_JSON_START';
-
-      const startIdx = text.indexOf(startMarker);
-      const endIdx = text.indexOf(endMarker, startIdx + startMarker.length);
-
-      if (startIdx >= 0 && endIdx > startIdx) {
-        fullResponses[key] = text.slice(startIdx + startMarker.length, endIdx).trim();
-      } else if (startIdx >= 0) {
-        const analysisIdx = text.indexOf('ANALYSIS_JSON_START', startIdx);
-        fullResponses[key] = text
-          .slice(startIdx + startMarker.length, analysisIdx > startIdx ? analysisIdx : undefined)
-          .trim();
-      } else {
-        fullResponses[key] = '';
-      }
-    }
+    // Extract per-query full responses using shared helper
+    const fullResponses = extractFullResponses(text, prompts);
 
     // Parse JSON block
     const jsonMatch = text.match(/ANALYSIS_JSON_START\s*([\s\S]*?)\s*ANALYSIS_JSON_END/);
