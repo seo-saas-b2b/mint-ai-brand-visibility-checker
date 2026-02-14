@@ -70,3 +70,24 @@ export interface AnalysisResult {
   recommendations: Recommendation[];
   analyzedAt: string;
 }
+
+// Progressive API response types
+export interface PromptsResponse {
+  prompts: string[];
+  brandName: string;
+  industry: string;
+  countryName: string;
+  countryFlag: string;
+}
+
+export interface PlatformAnalysisItem {
+  mentioned: boolean;
+  position: number | null;
+  sentiment: string;
+  snippet: string;
+}
+
+export interface PlatformBatchResponse {
+  analysis: Record<string, PlatformAnalysisItem>;
+  fullResponses: Record<string, string>;
+}
